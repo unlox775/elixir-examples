@@ -1,0 +1,113 @@
+#! /usr/bin/env elixir
+
+defmodule GenerateDetectColumnLengthQuery do
+  @usage """
+  Usage: bin/dev/generate_detect_column_length_query PG-DUMPFILE
+
+  It reads the table create statement, finds the string-type columns to 
+  examine for max length, and outputs a SQL statement which you can run.
+  This SQL query will examine the max length of each column for the last
+  million rows of data.  Save that output as a TAB-separated file (TSV),
+  and feed it into the next script, like this:
+
+  bin/dev/generate_table_precreate_migration PG-DUMPFILE MAX-LENGTH-TSVFILE
+  """
+
+  # uncomment this to see what lines get ignored by the below rules
+  @debug false
+
+  def call([]), do: IO.puts("Error No input file provided!\n\n#{@usage}")
+
+  def call([filename]) do
+    with {:read_schema, {:ok, schema_lines}} <- {:read_schema, read_lines(filename)},
+         {:parse_schema, schema} <-
+           {:parse_schema, parse_lines_into_tables_and_columns(schema_lines, nil, [])} do
+      schema
+      |> Enum.map(&map_into_query_sql/1)
+      |> output_with_unions
+    else
+      {_, {:error, error}} -> IO.puts("#{error}\n\n#{@usage}")
+    end
+  end
+
+  defp read_lines(filename) do
+    with {:file_exists, true} <- {:file_exists, File.exists?(filename)},
+         {:read, {:ok, contents}} <- {:read, File.read(filename)} do
+      {:ok, String.split(contents, "\n", trim: true)}
+    else
+      {:file_exists, _} -> {:error, "Error reading file: file does not exist: #{filename}"}
+      {:read, {:error, reason}} -> {:error, "Error reading file #{filename}: #{reason}"}
+      _ -> {:error, "An unknown error occurred while reading file: #{filename}"}
+    end
+  end
+
+  # Case: we just finished parsing everything and have no more lines to parse
+  defp parse_lines_into_tables_and_columns([], nil, acc), do: acc
+
+  defp parse_lines_into_tables_and_columns(lines, nil, acc) do
+    [this_row | lines] = lines
+
+    with %{"table_name" => table_name} <-
+           Regex.named_captures(~r/^create table (?<table_name>\w+)/, this_row) do
+      current_table = %{table_name: table_name, columns: []}
+      # Case: We have just fount an open create-table line, so parse it!
+      parse_lines_into_tables_and_columns(lines, current_table, acc)
+    else
+      # Case: We have no table declaration, and are skipping though the lines between tables
+      _ ->
+        if @debug do
+          IO.puts("SKIPPING between-table-create line: #{this_row}")
+        end
+
+        parse_lines_into_tables_and_columns(lines, nil, acc)
+    end
+  end
+
+  defp parse_lines_into_tables_and_columns(lines, current_table, acc)
+       when is_map(current_table) do
+    [this_row | lines] = lines
+
+    with %{"column_name" => column_name, "type" => type} <-
+           Regex.named_captures(
+             ~r/^\s*(?<column_name>\w+)\s+(?<type>(varchar|character varying|text|name|array|char|jsonb|anyarray|character|bytea|json))/i,
+             this_row
+           ) do
+      columns = current_table.columns ++ [{column_name, type}]
+      # Case: We are in the middle of parsing a create table, and just found a new column
+      parse_lines_into_tables_and_columns(lines, Map.put(current_table, :columns, columns), acc)
+    else
+      _ ->
+        with %{"end_table_delaration" => ")"} <-
+               Regex.named_captures(~r/^\s*(?<end_table_delaration>\))/i, this_row) do
+          # Case: We are in the middle of parsing a create table, and just found the END of the create-table
+          parse_lines_into_tables_and_columns(lines, nil, acc ++ [current_table])
+        else
+          # Case: We are in the middle of parsing a create table, but the current line is not a string type column.  Skip it!
+          _ ->
+            if @debug do
+              IO.puts("SKIPPING Non-string column line: #{this_row}")
+            end
+
+            parse_lines_into_tables_and_columns(lines, current_table, acc)
+        end
+    end
+  end
+
+  defp map_into_query_sql(%{table_name: table_name, columns: columns}) do
+    columns
+    |> Enum.map(fn {column_name, type} ->
+      "SELECT '#{table_name}' AS table_name, '#{column_name}' AS column_name, '#{type}' AS type, COALESCE(MAX(CHAR_LENGTH(#{
+        column_name
+      }::TEXT)),0) as max_length FROM (SELECT #{column_name} FROM #{table_name} ORDER BY id DESC LIMIT 1000000 ) s"
+    end)
+  end
+
+  defp output_with_unions(table_lists) do
+    table_lists
+    |> Enum.reduce([], &(&2 ++ &1))
+    |> Enum.join("\n    UNION ALL\n")
+    |> IO.puts()
+  end
+end
+
+GenerateDetectColumnLengthQuery.call(System.argv())
